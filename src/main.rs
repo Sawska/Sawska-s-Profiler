@@ -1,3 +1,12 @@
+mod frontend;
+mod interrupt;
+
+use frontend::ui::Ui;
+
 fn main() {
-    println!("Hello, world!");
+    let mut app = Ui::new(frontend::ui::default_palette());
+
+    loop {
+        app.update();
+    }
 }
