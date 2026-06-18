@@ -3,7 +3,8 @@
 
 use super::Report;
 use crate::interrupt::hardware_interrupt::{
-    BulkMeasurement, FileMeasurement, SweepResult, LATENCY_BOUNDS_NS,
+    BulkMeasurement, FileMeasurement, RandomMeasurement, SweepResult, WriteMeasurement,
+    LATENCY_BOUNDS_NS,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -199,6 +200,28 @@ fn profile_body(root: &str, files: &[FileMeasurement]) -> String {
     table.push_str("</tbody></table></section>");
     body.push_str(&table);
 
+    // Breakdown by file type.
+    let by_ext = super::ext_breakdown(files);
+    if by_ext.len() > 1 {
+        let mut t = String::from(
+            "<section class=\"chart\"><h2>By type</h2><table><thead><tr>\
+<th>ext</th><th class=\"r\">files</th><th class=\"r\">size</th>\
+<th class=\"r\">throughput</th></tr></thead><tbody>",
+        );
+        for e in &by_ext {
+            t.push_str(&format!(
+                "<tr><td>{}</td><td class=\"r\">{}</td><td class=\"r\">{}</td>\
+<td class=\"r\">{:.1} MiB/s</td></tr>",
+                esc(&e.ext),
+                e.files,
+                human_bytes(e.bytes),
+                e.throughput_mib_s(),
+            ));
+        }
+        t.push_str("</tbody></table></section>");
+        body.push_str(&t);
+    }
+
     let _ = root;
     body
 }
@@ -306,6 +329,29 @@ fn sweep_body(sweep: &SweepResult) -> String {
     body
 }
 
+// ── write & random bodies ────────────────────────────────────────────────────
+
+fn write_body(w: &WriteMeasurement) -> String {
+    cards(&[
+        ("BYTES WRITTEN", human_bytes(w.bytes)),
+        ("THROUGHPUT", format!("{:.1} MiB/s", w.throughput_mib_s())),
+        ("WALL TIME", format!("{:.2} ms", w.wall_nanos as f64 / 1e6)),
+        ("FSYNC", human_ns(w.fsync_nanos)),
+        ("BLOCK SIZE", human_bytes(w.chunk_size as u64)),
+    ])
+}
+
+fn random_body(r: &RandomMeasurement) -> String {
+    cards(&[
+        ("IOPS", format!("{:.0}", r.iops())),
+        ("OPS", r.ops.to_string()),
+        ("BLOCK SIZE", human_bytes(r.block_size as u64)),
+        ("AVG LATENCY", human_ns(r.avg_nanos)),
+        ("P99 LATENCY", human_ns(r.p99_nanos)),
+        ("READ MODE", if r.uncached { "uncached".into() } else { "cached".into() }),
+    ])
+}
+
 // ── page shell ───────────────────────────────────────────────────────────────
 
 pub fn render(r: &Report) -> String {
@@ -313,6 +359,8 @@ pub fn render(r: &Report) -> String {
         Report::Profile { root, files } => ("Profile", root.clone(), profile_body(root, files)),
         Report::Bulk { root, bulk } => ("Bulk throughput", root.clone(), bulk_body(root, bulk)),
         Report::Sweep { sweep } => ("Block-size sweep", sweep.path.clone(), sweep_body(sweep)),
+        Report::Write { write } => ("Write benchmark", write.path.clone(), write_body(write)),
+        Report::Random { random } => ("Random access", random.path.clone(), random_body(random)),
     };
 
     let generated = SystemTime::now()

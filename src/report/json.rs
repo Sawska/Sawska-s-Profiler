@@ -139,5 +139,30 @@ pub fn render(r: &Report) -> String {
                 points.join(",")
             )
         }
+        Report::Write { write } => format!(
+            "{{\"kind\":\"write\",\"path\":\"{}\",\"bytes\":{},\"chunk_size\":{},\
+\"wall_nanos\":{},\"fsync_nanos\":{},\"throughput_mib_s\":{:.4},\"counter_hz\":{}}}\n",
+            esc(&write.path),
+            write.bytes,
+            write.chunk_size,
+            write.wall_nanos,
+            write.fsync_nanos,
+            write.throughput_mib_s(),
+            write.counter_hz,
+        ),
+        Report::Random { random } => format!(
+            "{{\"kind\":\"random\",\"path\":\"{}\",\"block_size\":{},\"ops\":{},\"bytes\":{},\
+\"wall_nanos\":{},\"iops\":{:.1},\"avg_ns\":{},\"p99_ns\":{},\"uncached\":{},\"counter_hz\":{}}}\n",
+            esc(&random.path),
+            random.block_size,
+            random.ops,
+            random.bytes,
+            random.wall_nanos,
+            random.iops(),
+            random.avg_nanos,
+            random.p99_nanos,
+            random.uncached,
+            random.counter_hz,
+        ),
     }
 }

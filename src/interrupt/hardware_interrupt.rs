@@ -935,6 +935,213 @@ pub fn sweep_file(path: &str, sizes: &[usize], uncached: bool) -> io::Result<Swe
 }
 
 // ============================================================
+//  Write benchmark & random-access (IOPS)
+// ============================================================
+
+/// Tiny xorshift64 PRNG — enough to scatter read offsets without pulling in a
+/// crate. Seeded from the monotonic clock (no Math.random equivalent in std).
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteMeasurement {
+    pub path: String,
+    pub bytes: u64,
+    pub chunk_size: usize,
+    pub wall_nanos: u64,
+    pub fsync_nanos: u64,
+    pub counter_hz: u64,
+}
+
+impl WriteMeasurement {
+    pub fn throughput_mib_s(&self) -> f64 {
+        let secs = self.wall_nanos as f64 / 1e9;
+        if secs <= 0.0 {
+            0.0
+        } else {
+            (self.bytes as f64 / (1024.0 * 1024.0)) / secs
+        }
+    }
+}
+
+/// Sequential write benchmark: writes `total_bytes` to a temp file inside
+/// `dir`, fsyncs, and measures throughput — so it reflects the write speed of
+/// the volume `dir` lives on. The temp file is always removed.
+pub fn write_benchmark(dir: &str, total_bytes: u64, chunk_size: usize) -> io::Result<WriteMeasurement> {
+    let chunk = chunk_size.max(1);
+    let tmp = format!("{}/.sawskas_write_bench.tmp", dir.trim_end_matches('/'));
+    let c_path = CString::new(tmp.clone())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+
+    let fd = unsafe { open(c_path.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644 as c_int) };
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(errno()));
+    }
+
+    let hz = counter_hz();
+    let buf = vec![0xA5u8; chunk];
+    let mut written = 0u64;
+    let start = read_counter();
+
+    while written < total_bytes {
+        let want = chunk.min((total_bytes - written) as usize);
+        let n = unsafe { write(fd, buf.as_ptr() as *const c_void, want) };
+        if n < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            let e = io::Error::from_raw_os_error(errno());
+            unsafe {
+                close(fd);
+                unlink(c_path.as_ptr());
+            }
+            return Err(e);
+        }
+        written += n as u64;
+    }
+
+    let pre_sync = read_counter();
+    unsafe { fsync(fd) };
+    let fsync_nanos = ticks_to_nanos(read_counter().wrapping_sub(pre_sync), hz);
+    let wall_nanos = ticks_to_nanos(read_counter().wrapping_sub(start), hz);
+
+    unsafe {
+        close(fd);
+        unlink(c_path.as_ptr());
+    }
+
+    Ok(WriteMeasurement {
+        path: tmp,
+        bytes: written,
+        chunk_size: chunk,
+        wall_nanos,
+        fsync_nanos,
+        counter_hz: hz,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RandomMeasurement {
+    pub path: String,
+    pub block_size: usize,
+    pub ops: u64,
+    pub bytes: u64,
+    pub wall_nanos: u64,
+    pub avg_nanos: u64,
+    pub p99_nanos: u64,
+    pub counter_hz: u64,
+    pub uncached: bool,
+}
+
+impl RandomMeasurement {
+    pub fn iops(&self) -> f64 {
+        let secs = self.wall_nanos as f64 / 1e9;
+        if secs <= 0.0 {
+            0.0
+        } else {
+            self.ops as f64 / secs
+        }
+    }
+}
+
+/// Random-access benchmark: reads `ops` blocks of `block_size` bytes at random
+/// aligned offsets, reporting IOPS and per-op latency (avg + p99).
+pub fn random_access(
+    path: &str,
+    block_size: usize,
+    ops: u64,
+    uncached: bool,
+) -> io::Result<RandomMeasurement> {
+    let block = block_size.max(1);
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(errno()));
+    }
+    let _fd_guard = FdGuard(fd);
+    if uncached {
+        set_uncached(fd);
+    }
+
+    let size = unsafe { lseek(fd, 0, SEEK_END) };
+    if size <= 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty file"));
+    }
+    let hz = counter_hz();
+    let max_off = (size as u64).saturating_sub(block as u64);
+    let mut rng = Rng::new(monotonic_nanos());
+    let mut buf = vec![0u8; block];
+    let mut lats: Vec<u32> = Vec::with_capacity(ops as usize);
+    let mut bytes = 0u64;
+
+    let start = read_counter();
+    let mut done = 0u64;
+    while done < ops {
+        // Random block-aligned offset.
+        let raw = if max_off == 0 {
+            0
+        } else {
+            rng.next_u64() % (max_off + 1)
+        };
+        let off = (raw - (raw % block as u64)) as i64;
+        if unsafe { lseek(fd, off, SEEK_SET) } < 0 {
+            return Err(io::Error::from_raw_os_error(errno()));
+        }
+        let t0 = read_counter();
+        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, block) };
+        let dt = read_counter().wrapping_sub(t0);
+        if n < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(errno()));
+        }
+        bytes += n as u64;
+        lats.push(ticks_to_nanos(dt, hz).min(u32::MAX as u64) as u32);
+        done += 1;
+    }
+    let wall_nanos = ticks_to_nanos(read_counter().wrapping_sub(start), hz);
+
+    let avg_nanos = if lats.is_empty() {
+        0
+    } else {
+        lats.iter().map(|&x| x as u64).sum::<u64>() / lats.len() as u64
+    };
+    lats.sort_unstable();
+    let p99_nanos = if lats.is_empty() {
+        0
+    } else {
+        let idx = ((0.99) * (lats.len() - 1) as f64).round() as usize;
+        lats[idx.min(lats.len() - 1)] as u64
+    };
+
+    Ok(RandomMeasurement {
+        path: path.to_string(),
+        block_size: block,
+        ops: done,
+        bytes,
+        wall_nanos,
+        avg_nanos,
+        p99_nanos,
+        counter_hz: hz,
+        uncached,
+    })
+}
+
+// ============================================================
 //  File discovery
 // ============================================================
 
@@ -1141,6 +1348,31 @@ mod tests {
         }
         assert!(s.best().is_some());
         assert!(s.counter_hz > 0);
+    }
+
+    #[test]
+    fn write_benchmark_writes_and_cleans_up() {
+        let dir = std::env::temp_dir();
+        let m = write_benchmark(dir.to_str().unwrap(), 4 * 1024 * 1024, 256 * 1024).unwrap();
+        assert_eq!(m.bytes, 4 * 1024 * 1024);
+        assert!(m.counter_hz > 0);
+        // Temp file must not linger.
+        assert!(!std::path::Path::new(&m.path).exists());
+    }
+
+    #[test]
+    fn random_access_runs_requested_ops() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("sawskas_rand_test.bin");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&vec![0u8; 2 * 1024 * 1024]).unwrap();
+        }
+        let m = random_access(path.to_str().unwrap(), 4096, 500, false).unwrap();
+        assert_eq!(m.ops, 500);
+        assert!(m.iops() > 0.0);
+        assert!(m.counter_hz > 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

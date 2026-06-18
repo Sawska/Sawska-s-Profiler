@@ -73,6 +73,30 @@ timer_interrupts,counter_hz\n",
                 ));
             }
         }
+        Report::Write { write } => {
+            out.push_str("bytes,chunk_size,wall_nanos,fsync_nanos,throughput_mib_s\n");
+            out.push_str(&format!(
+                "{},{},{},{},{:.4}\n",
+                write.bytes,
+                write.chunk_size,
+                write.wall_nanos,
+                write.fsync_nanos,
+                write.throughput_mib_s(),
+            ));
+        }
+        Report::Random { random } => {
+            out.push_str("block_size,ops,bytes,wall_nanos,iops,avg_ns,p99_ns\n");
+            out.push_str(&format!(
+                "{},{},{},{},{:.1},{},{}\n",
+                random.block_size,
+                random.ops,
+                random.bytes,
+                random.wall_nanos,
+                random.iops(),
+                random.avg_nanos,
+                random.p99_nanos,
+            ));
+        }
     }
     out
 }

@@ -22,6 +22,8 @@ pub struct Config {
     pub path: String,
     pub bulk: bool,
     pub sweep: bool,
+    pub write: bool,
+    pub random: bool,
     pub uncached: bool,
     pub threads: usize,
     pub filter: Filter,
@@ -29,6 +31,7 @@ pub struct Config {
     pub json: Option<PathBuf>,
     pub csv: Option<PathBuf>,
     pub html: Option<PathBuf>,
+    pub md: Option<PathBuf>,
 }
 
 pub fn help() -> String {
@@ -44,6 +47,8 @@ USAGE:\n\
 OPTIONS:\n\
     --bulk                Parallel bulk-throughput mode (no per-file sampling)\n\
     --sweep               Block-size sweep on a single file (4 KiB → 16 MiB)\n\
+    --write               Sequential write benchmark into PATH (a directory)\n\
+    --random              Random-access IOPS benchmark on PATH (a file)\n\
     --uncached            Bypass the page cache (measure storage, not RAM)\n\
     --threads N           Worker threads for --bulk (default: CPU count)\n\
     --ext LIST            Only files with these extensions, e.g. rs,toml\n\
@@ -52,6 +57,7 @@ OPTIONS:\n\
     --json [FILE]         Write a JSON report (default: profiler-report.json)\n\
     --csv  [FILE]         Write a CSV report  (default: profiler-report.csv)\n\
     --html [FILE]         Write an HTML report with graphs (default: profiler-report.html)\n\
+    --md   [FILE]         Write a Markdown report (default: profiler-report.md)\n\
     -h, --help            Show this help\n\
 \n\
 EXAMPLES:\n\
@@ -66,6 +72,8 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
     let mut path: Option<String> = None;
     let mut bulk = false;
     let mut sweep = false;
+    let mut write = false;
+    let mut random = false;
     let mut uncached = false;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -76,6 +84,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
     let mut json: Option<PathBuf> = None;
     let mut csv: Option<PathBuf> = None;
     let mut html: Option<PathBuf> = None;
+    let mut md: Option<PathBuf> = None;
 
     // Pulls an optional value for --json/--csv/--html: consumes the next arg
     // only if it isn't another flag; otherwise returns the given default name.
@@ -86,6 +95,8 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             "-h" | "--help" => return Ok(Mode::Help),
             "--bulk" => bulk = true,
             "--sweep" => sweep = true,
+            "--write" => write = true,
+            "--random" => random = true,
             "--uncached" => uncached = true,
             "--all" => skip_hidden = false,
             "--threads" => {
@@ -106,10 +117,11 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
                 sort = SortKey::parse(v);
                 i += 1;
             }
-            "--json" | "--csv" | "--html" => {
+            "--json" | "--csv" | "--html" | "--md" => {
                 let default = match a.as_str() {
                     "--json" => "profiler-report.json",
                     "--csv" => "profiler-report.csv",
+                    "--md" => "profiler-report.md",
                     _ => "profiler-report.html",
                 };
                 let next_is_value = args
@@ -125,6 +137,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
                 match a.as_str() {
                     "--json" => json = Some(file),
                     "--csv" => csv = Some(file),
+                    "--md" => md = Some(file),
                     _ => html = Some(file),
                 }
             }
@@ -144,7 +157,15 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
     match path {
         None => {
             // Output flags without a path don't make sense headless.
-            if json.is_some() || csv.is_some() || html.is_some() || bulk || sweep {
+            if json.is_some()
+                || csv.is_some()
+                || html.is_some()
+                || md.is_some()
+                || bulk
+                || sweep
+                || write
+                || random
+            {
                 Err("a PATH is required for headless mode".to_string())
             } else {
                 Ok(Mode::Interactive)
@@ -154,6 +175,8 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             path,
             bulk,
             sweep,
+            write,
+            random,
             uncached,
             threads,
             filter: Filter {
@@ -164,6 +187,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             json,
             csv,
             html,
+            md,
         })),
     }
 }
@@ -182,6 +206,47 @@ fn parse_extensions(raw: &str) -> Vec<String> {
 /// Runs a headless measurement and writes any requested reports. Returns a
 /// process exit code.
 pub fn run(cfg: Config) -> i32 {
+    // Write / random don't enumerate a file set — handle them up front.
+    if cfg.write {
+        const TOTAL: u64 = 256 * 1024 * 1024;
+        const CHUNK: usize = 256 * 1024;
+        return match hardware_interrupt::write_benchmark(&cfg.path, TOTAL, CHUNK) {
+            Ok(w) => {
+                println!(
+                    "write · {} · {:.1} MiB/s · fsync {} ns",
+                    human_bytes(w.bytes),
+                    w.throughput_mib_s(),
+                    w.fsync_nanos,
+                );
+                emit(&cfg, &Report::Write { write: w })
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+    if cfg.random {
+        const BLOCK: usize = 4096;
+        const OPS: u64 = 100_000;
+        return match hardware_interrupt::random_access(&cfg.path, BLOCK, OPS, cfg.uncached) {
+            Ok(r) => {
+                println!(
+                    "random · {} ops · {:.0} IOPS · avg {} ns · p99 {} ns",
+                    r.ops,
+                    r.iops(),
+                    r.avg_nanos,
+                    r.p99_nanos,
+                );
+                emit(&cfg, &Report::Random { random: r })
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+
     let files = match hardware_interrupt::collect_files_filtered(&cfg.path, &cfg.filter) {
         Ok(f) if !f.is_empty() => f,
         Ok(_) => {
@@ -267,15 +332,21 @@ pub fn run(cfg: Config) -> i32 {
         }
     };
 
+    emit(&cfg, &report)
+}
+
+/// Writes any requested JSON/CSV/HTML reports; returns a process exit code.
+fn emit(cfg: &Config, report: &Report) -> i32 {
     let mut exit = 0;
-    let outputs: [(&Option<PathBuf>, fn(&Report) -> String); 3] = [
+    let outputs: [(&Option<PathBuf>, fn(&Report) -> String); 4] = [
         (&cfg.json, Report::to_json),
         (&cfg.csv, Report::to_csv),
         (&cfg.html, Report::to_html),
+        (&cfg.md, Report::to_markdown),
     ];
     for (opt, render) in outputs {
         if let Some(path) = opt {
-            match Report::write(path, &render(&report)) {
+            match Report::write(path, &render(report)) {
                 Ok(()) => eprintln!("wrote {}", path.display()),
                 Err(e) => {
                     eprintln!("error: failed to write {}: {e}", path.display());

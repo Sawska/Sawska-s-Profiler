@@ -150,10 +150,12 @@ struct MenuItem {
     target: UiState,
 }
 
-const MENU_ITEMS: [MenuItem; 5] = [
+const MENU_ITEMS: [MenuItem; 7] = [
     MenuItem { label: "RUN DAEMON",         target: UiState::Run    },
     MenuItem { label: "BULK THROUGHPUT",    target: UiState::Bulk   },
     MenuItem { label: "BLOCK-SIZE SWEEP",   target: UiState::Sweep  },
+    MenuItem { label: "WRITE BENCHMARK",    target: UiState::Write  },
+    MenuItem { label: "RANDOM ACCESS",      target: UiState::Random },
     MenuItem { label: "EXPORT REPORT",      target: UiState::Export },
     MenuItem { label: "TERMINATE SESSION",  target: UiState::Exit   },
 ];
@@ -168,6 +170,8 @@ enum UiState {
     Run,
     Bulk,
     Sweep,
+    Write,
+    Random,
     Export,
     Exit,
     Error,
@@ -1069,6 +1073,91 @@ impl Ui {
     }
 
     // --------------------------------------------------------
+    //  Write & random-access benchmarks
+    // --------------------------------------------------------
+
+    /// Sequential write benchmark into a target directory.
+    fn run_write(&mut self) {
+        let input = self.prompt_path(".");
+        println!();
+        if !Path::new(&input).is_dir() {
+            self.scan_error("write benchmark needs a target directory");
+            return;
+        }
+
+        const TOTAL: u64 = 256 * 1024 * 1024;
+        const CHUNK: usize = 256 * 1024;
+        println!(
+            "  {} {}",
+            "WRITING".color(NEON_MAGENTA).bold(),
+            format!("{} into {} …", human_bytes(TOTAL), input).color(DIM_SLATE),
+        );
+        io::stdout().flush().unwrap();
+
+        match hardware_interrupt::write_benchmark(&input, TOTAL, CHUNK) {
+            Ok(w) => {
+                println!("  {}", "✓ WRITE COMPLETE".color(NEON_GREEN).bold());
+                println!();
+                self.print_divider(NEON_PURPLE);
+                self.report_row("BYTES", human_bytes(w.bytes));
+                self.report_row("BLOCK SIZE", human_bytes(w.chunk_size as u64));
+                self.report_row("WALL TIME", format!("{:.3} ms", w.wall_nanos as f64 / 1e6));
+                self.report_row("THROUGHPUT", format!("{:.2} MiB/s", w.throughput_mib_s()));
+                self.report_row("FSYNC", format!("{:.3} ms", w.fsync_nanos as f64 / 1e6));
+                self.print_divider(NEON_PURPLE);
+                self.last_report = Some(Report::Write { write: w });
+            }
+            Err(e) => self.scan_error(&e.to_string()),
+        }
+    }
+
+    /// Random-access (IOPS) benchmark on a single file.
+    fn run_random(&mut self) {
+        let default = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "Cargo.toml".to_string());
+        let input = self.prompt_path(&default);
+
+        if !Path::new(&input).is_file() {
+            println!();
+            self.scan_error("random access needs a single file");
+            return;
+        }
+        let uncached = self.prompt_uncached();
+        println!();
+
+        const BLOCK: usize = 4096;
+        const OPS: u64 = 100_000;
+        println!(
+            "  {} {}",
+            "SEEKING".color(NEON_CYAN).bold(),
+            format!("{OPS} random {} reads…", human_bytes(BLOCK as u64)).color(DIM_SLATE),
+        );
+        io::stdout().flush().unwrap();
+
+        match hardware_interrupt::random_access(&input, BLOCK, OPS, uncached) {
+            Ok(r) => {
+                println!("  {}", "✓ RANDOM COMPLETE".color(NEON_GREEN).bold());
+                println!();
+                self.print_divider(NEON_PURPLE);
+                self.report_row("FILE", r.path.clone());
+                self.report_row("BLOCK SIZE", human_bytes(r.block_size as u64));
+                self.report_row("OPS", format!("{}", r.ops));
+                self.report_row("IOPS", format!("{:.0}", r.iops()));
+                self.report_row(
+                    "LATENCY",
+                    format!("avg {} ns · p99 {} ns", r.avg_nanos, r.p99_nanos),
+                );
+                self.report_row("READ MODE", if r.uncached { "uncached".into() } else { "cached".into() });
+                self.print_divider(NEON_PURPLE);
+                self.last_report = Some(Report::Random { random: r });
+            }
+            Err(e) => self.scan_error(&e.to_string()),
+        }
+    }
+
+    // --------------------------------------------------------
     //  Report export (JSON / CSV / HTML)
     // --------------------------------------------------------
 
@@ -1095,10 +1184,11 @@ impl Ui {
         };
 
         println!();
-        let outputs: [(&str, fn(&Report) -> String); 3] = [
+        let outputs: [(&str, fn(&Report) -> String); 4] = [
             ("json", Report::to_json),
             ("csv", Report::to_csv),
             ("html", Report::to_html),
+            ("md", Report::to_markdown),
         ];
         for (ext, render) in outputs {
             let path = std::path::PathBuf::from(format!("{base}.{ext}"));
@@ -1182,6 +1272,28 @@ impl Ui {
                 println!();
 
                 self.run_sweep();
+
+                self.current_state = UiState::Input;
+            }
+            UiState::Write => {
+                println!();
+                self.print_divider(NEON_MAGENTA);
+                self.type_sentence("WRITE BENCHMARK...", 15);
+                self.print_divider(NEON_MAGENTA);
+                println!();
+
+                self.run_write();
+
+                self.current_state = UiState::Input;
+            }
+            UiState::Random => {
+                println!();
+                self.print_divider(NEON_CYAN);
+                self.type_sentence("RANDOM-ACCESS BENCHMARK...", 15);
+                self.print_divider(NEON_CYAN);
+                println!();
+
+                self.run_random();
 
                 self.current_state = UiState::Input;
             }
