@@ -41,12 +41,30 @@ use std::time::Duration;
 // ============================================================
 
 const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 const ITIMER_REAL: c_int = 0;
 const SIGALRM: c_int = 14; // identical on macOS and Linux
 const EINTR: c_int = 4;
 const SIG_ERR: usize = usize::MAX; // (sighandler_t)-1
+
+// O_CREAT / O_TRUNC differ between macOS and Linux.
+#[cfg(target_os = "macos")]
+const O_CREAT: c_int = 0x0200;
+#[cfg(target_os = "macos")]
+const O_TRUNC: c_int = 0x0400;
+#[cfg(not(target_os = "macos"))]
+const O_CREAT: c_int = 0x40;
+#[cfg(not(target_os = "macos"))]
+const O_TRUNC: c_int = 0x200;
+
+/// macOS `fcntl` command to disable the unified buffer cache for an fd.
+#[cfg(target_os = "macos")]
+const F_NOCACHE: c_int = 48;
+/// Linux `posix_fadvise` advice to drop cached pages.
+#[cfg(not(target_os = "macos"))]
+const POSIX_FADV_DONTNEED: c_int = 4;
 
 #[cfg(target_os = "macos")]
 const CLOCK_MONOTONIC: c_int = 6;
@@ -88,17 +106,45 @@ struct Itimerval {
 }
 
 unsafe extern "C" {
-    // `open` is variadic in C (`int open(const char*, int, ...)`); we never pass
-    // a mode (read-only), so a two-arg declaration is ABI-correct here.
-    fn open(path: *const c_char, oflag: c_int) -> c_int;
+    // `open` is variadic in C (`int open(const char*, int, ...)`); the optional
+    // third arg is the mode, used only when creating a file (write benchmark).
+    fn open(path: *const c_char, oflag: c_int, ...) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn close(fd: c_int) -> c_int;
+    fn fsync(fd: c_int) -> c_int;
+    fn unlink(path: *const c_char) -> c_int;
     fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
     fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
     fn setitimer(which: c_int, new: *const Itimerval, old: *mut Itimerval) -> c_int;
     // BSD-semantics `signal()` (persistent handler + SA_RESTART) on both macOS
     // and glibc — avoids the wildly platform-divergent `struct sigaction`.
     fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" {
+    fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+}
+
+/// Best-effort request that reads on `fd` bypass the page cache, so we measure
+/// storage rather than RAM. On macOS this is `fcntl(F_NOCACHE)`; on Linux we
+/// drop any already-cached pages with `posix_fadvise(DONTNEED)`. Neither can
+/// force-evict resident pages held by other handles without elevated
+/// privileges, so this is a best effort — documented as such.
+fn set_uncached(fd: c_int) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        fcntl(fd, F_NOCACHE, 1);
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -295,6 +341,10 @@ pub struct FileMeasurement {
     pub samples: Vec<Sample>,
     /// Per-chunk read-latency distribution; see [`LATENCY_BOUNDS_NS`].
     pub latency_buckets: [u64; LATENCY_BUCKETS],
+    /// Whether reads bypassed the page cache (best effort).
+    pub uncached: bool,
+    /// Per-chunk read latencies in ns, retained for exact percentiles.
+    pub chunk_nanos: Vec<u32>,
 }
 
 impl FileMeasurement {
@@ -305,6 +355,22 @@ impl FileMeasurement {
         } else {
             (self.bytes_read as f64 / (1024.0 * 1024.0)) / secs
         }
+    }
+
+    /// Returns the requested latency percentiles (ns), sorting once. `ps` are
+    /// in 0–100; e.g. `percentiles_ns(&[50.0, 95.0, 99.0])`.
+    pub fn percentiles_ns(&self, ps: &[f64]) -> Vec<u64> {
+        if self.chunk_nanos.is_empty() {
+            return vec![0; ps.len()];
+        }
+        let mut v = self.chunk_nanos.clone();
+        v.sort_unstable();
+        ps.iter()
+            .map(|p| {
+                let idx = ((p / 100.0) * (v.len() - 1) as f64).round() as usize;
+                v[idx.min(v.len() - 1)] as u64
+            })
+            .collect()
     }
 
     pub fn avg_chunk_nanos(&self) -> u64 {
@@ -376,8 +442,12 @@ impl fmt::Display for FileMeasurement {
 ///
 /// `sample_interval` sets how often the hardware timer fires (e.g. 2 ms). Each
 /// firing flags a progress snapshot recorded at the next chunk boundary.
-pub fn measure_file(path: &str, sample_interval: Duration) -> io::Result<FileMeasurement> {
-    measure_file_with(path, sample_interval, |_| {})
+pub fn measure_file(
+    path: &str,
+    sample_interval: Duration,
+    uncached: bool,
+) -> io::Result<FileMeasurement> {
+    measure_file_with(path, sample_interval, uncached, |_| {})
 }
 
 /// Like [`measure_file`], but invokes `on_sample` each time the hardware timer
@@ -388,6 +458,7 @@ pub fn measure_file(path: &str, sample_interval: Duration) -> io::Result<FileMea
 pub fn measure_file_with<F: FnMut(Progress)>(
     path: &str,
     sample_interval: Duration,
+    uncached: bool,
     mut on_sample: F,
 ) -> io::Result<FileMeasurement> {
     // Acquire the process-wide guard — the timer + handler are global state.
@@ -411,6 +482,9 @@ pub fn measure_file_with<F: FnMut(Progress)>(
         return Err(io::Error::from_raw_os_error(errno()));
     }
     let _fd_guard = FdGuard(fd);
+    if uncached {
+        set_uncached(fd);
+    }
 
     // ── size via lseek(END) then rewind ──────────────────────────────────
     let size = unsafe { lseek(fd, 0, SEEK_END) };
@@ -439,6 +513,7 @@ pub fn measure_file_with<F: FnMut(Progress)>(
     let mut min_chunk_ticks = u64::MAX;
     let mut max_chunk_ticks = 0u64;
     let mut latency_buckets = [0u64; LATENCY_BUCKETS];
+    let mut chunk_nanos: Vec<u32> = Vec::new();
     let mut samples: Vec<Sample> = Vec::new();
 
     let start_ns = monotonic_nanos();
@@ -465,7 +540,9 @@ pub fn measure_file_with<F: FnMut(Progress)>(
         chunk_count += 1;
         min_chunk_ticks = min_chunk_ticks.min(dt);
         max_chunk_ticks = max_chunk_ticks.max(dt);
-        latency_buckets[latency_bucket(ticks_to_nanos(dt, hz))] += 1;
+        let dt_ns = ticks_to_nanos(dt, hz);
+        latency_buckets[latency_bucket(dt_ns)] += 1;
+        chunk_nanos.push(dt_ns.min(u32::MAX as u64) as u32);
 
         // Did a hardware timer interrupt fire since the last chunk? If so,
         // snapshot progress now. The cadence is the interrupt's, not ours.
@@ -506,6 +583,8 @@ pub fn measure_file_with<F: FnMut(Progress)>(
         counter_hz: hz,
         samples,
         latency_buckets,
+        uncached,
+        chunk_nanos,
     })
 }
 
@@ -598,6 +677,7 @@ pub struct BulkMeasurement {
     pub errors: u64,
     pub counter_hz: u64,
     pub counter_ticks: u64,
+    pub uncached: bool,
     pub per_thread: Vec<ThreadStat>,
 }
 
@@ -613,7 +693,7 @@ impl BulkMeasurement {
 }
 
 /// Reads a single file to EOF with raw syscalls, returning the byte count.
-fn read_file_raw(path: &str, buf: &mut [u8]) -> io::Result<u64> {
+fn read_file_raw(path: &str, buf: &mut [u8], uncached: bool) -> io::Result<u64> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
     let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
@@ -621,6 +701,9 @@ fn read_file_raw(path: &str, buf: &mut [u8]) -> io::Result<u64> {
         return Err(io::Error::from_raw_os_error(errno()));
     }
     let _fd_guard = FdGuard(fd);
+    if uncached {
+        set_uncached(fd);
+    }
 
     let mut total = 0u64;
     loop {
@@ -641,7 +724,7 @@ fn read_file_raw(path: &str, buf: &mut [u8]) -> io::Result<u64> {
 
 /// Reads `files` concurrently across `threads` worker threads, timing the whole
 /// operation with the hardware counter and reporting aggregate throughput.
-pub fn measure_bulk(files: &[PathBuf], threads: usize) -> BulkMeasurement {
+pub fn measure_bulk(files: &[PathBuf], threads: usize, uncached: bool) -> BulkMeasurement {
     let threads = threads.clamp(1, 256);
     let n = files.len();
     // Ceil-divide so every file is covered by exactly one contiguous slice.
@@ -665,7 +748,7 @@ pub fn measure_bulk(files: &[PathBuf], threads: usize) -> BulkMeasurement {
                 let mut buf = vec![0u8; READ_CHUNK];
                 for f in chunk {
                     match f.to_str() {
-                        Some(p) => match read_file_raw(p, &mut buf) {
+                        Some(p) => match read_file_raw(p, &mut buf, uncached) {
                             Ok(b) => bytes += b,
                             Err(_) => errors += 1,
                         },
@@ -704,6 +787,7 @@ pub fn measure_bulk(files: &[PathBuf], threads: usize) -> BulkMeasurement {
         errors: total_errors,
         counter_hz: hz,
         counter_ticks,
+        uncached,
         per_thread,
     }
 }
@@ -754,6 +838,7 @@ pub struct SweepResult {
     pub path: String,
     pub size_bytes: u64,
     pub counter_hz: u64,
+    pub uncached: bool,
     pub points: Vec<SweepPoint>,
 }
 
@@ -797,7 +882,7 @@ fn read_pass(fd: c_int, chunk: usize) -> io::Result<(u64, u64, u64)> {
 }
 
 /// Sweeps `path` across the given block `sizes`, reporting throughput per size.
-pub fn sweep_file(path: &str, sizes: &[usize]) -> io::Result<SweepResult> {
+pub fn sweep_file(path: &str, sizes: &[usize], uncached: bool) -> io::Result<SweepResult> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
     let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
@@ -805,6 +890,9 @@ pub fn sweep_file(path: &str, sizes: &[usize]) -> io::Result<SweepResult> {
         return Err(io::Error::from_raw_os_error(errno()));
     }
     let _fd_guard = FdGuard(fd);
+    if uncached {
+        set_uncached(fd);
+    }
 
     let size = unsafe { lseek(fd, 0, SEEK_END) };
     if size < 0 {
@@ -812,8 +900,11 @@ pub fn sweep_file(path: &str, sizes: &[usize]) -> io::Result<SweepResult> {
     }
     let hz = counter_hz();
 
-    // Warm-up pass so subsequent points measure a consistent cache state.
-    let _ = read_pass(fd, 256 * 1024)?;
+    // Warm-up pass so cached points measure a consistent (warm) cache state.
+    // For an uncached sweep we *want* cold reads, so skip it.
+    if !uncached {
+        let _ = read_pass(fd, 256 * 1024)?;
+    }
 
     let mut points = Vec::with_capacity(sizes.len());
     for &chunk in sizes {
@@ -838,6 +929,7 @@ pub fn sweep_file(path: &str, sizes: &[usize]) -> io::Result<SweepResult> {
         path: path.to_string(),
         size_bytes: size as u64,
         counter_hz: hz,
+        uncached,
         points,
     })
 }
@@ -970,7 +1062,7 @@ mod tests {
     fn measures_a_real_file() {
         let _g = timer_guard();
         // Cargo runs tests from the crate root, so this path exists.
-        let m = measure_file("Cargo.toml", Duration::from_micros(500))
+        let m = measure_file("Cargo.toml", Duration::from_micros(500), false)
             .expect("measurement failed");
         assert!(m.size_bytes > 0);
         assert_eq!(m.bytes_read, m.size_bytes);
@@ -980,7 +1072,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_an_error() {
-        let r = measure_file("definitely/not/here.xyz", Duration::from_millis(1));
+        let r = measure_file("definitely/not/here.xyz", Duration::from_millis(1), false);
         assert!(r.is_err());
     }
 
@@ -1027,8 +1119,8 @@ mod tests {
     #[test]
     fn latency_histogram_accounts_for_every_chunk() {
         let _g = timer_guard();
-        let m = measure_file("Cargo.lock", Duration::from_millis(1))
-            .or_else(|_| measure_file("Cargo.toml", Duration::from_millis(1)))
+        let m = measure_file("Cargo.lock", Duration::from_millis(1), false)
+            .or_else(|_| measure_file("Cargo.toml", Duration::from_millis(1), false))
             .unwrap();
         let bucketed: u64 = m.latency_buckets.iter().sum();
         assert_eq!(
@@ -1040,8 +1132,8 @@ mod tests {
     #[test]
     fn sweep_reads_full_file_at_every_size() {
         let sizes = [4 * 1024, 64 * 1024, 1024 * 1024];
-        let s = sweep_file("Cargo.lock", &sizes)
-            .or_else(|_| sweep_file("Cargo.toml", &sizes))
+        let s = sweep_file("Cargo.lock", &sizes, false)
+            .or_else(|_| sweep_file("Cargo.toml", &sizes, false))
             .unwrap();
         assert_eq!(s.points.len(), sizes.len());
         for p in &s.points {
@@ -1062,7 +1154,7 @@ mod tests {
             .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .sum();
 
-        let m = measure_bulk(&files, 4);
+        let m = measure_bulk(&files, 4, false);
         assert_eq!(m.file_count, files.len() as u64);
         assert_eq!(m.errors, 0);
         assert_eq!(m.bytes_read, expected, "bulk byte total must match metadata");
@@ -1116,7 +1208,7 @@ mod tests {
             f.flush().unwrap();
         }
 
-        let m = measure_file(path.to_str().unwrap(), Duration::from_millis(2)).unwrap();
+        let m = measure_file(path.to_str().unwrap(), Duration::from_millis(2), false).unwrap();
         println!("\n{m}\n");
         for s in &m.samples {
             println!(

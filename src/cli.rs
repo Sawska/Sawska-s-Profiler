@@ -22,6 +22,7 @@ pub struct Config {
     pub path: String,
     pub bulk: bool,
     pub sweep: bool,
+    pub uncached: bool,
     pub threads: usize,
     pub filter: Filter,
     pub sort: SortKey,
@@ -43,6 +44,7 @@ USAGE:\n\
 OPTIONS:\n\
     --bulk                Parallel bulk-throughput mode (no per-file sampling)\n\
     --sweep               Block-size sweep on a single file (4 KiB → 16 MiB)\n\
+    --uncached            Bypass the page cache (measure storage, not RAM)\n\
     --threads N           Worker threads for --bulk (default: CPU count)\n\
     --ext LIST            Only files with these extensions, e.g. rs,toml\n\
     --all                 Include hidden (dot) files (default: skipped)\n\
@@ -64,6 +66,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
     let mut path: Option<String> = None;
     let mut bulk = false;
     let mut sweep = false;
+    let mut uncached = false;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -83,6 +86,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             "-h" | "--help" => return Ok(Mode::Help),
             "--bulk" => bulk = true,
             "--sweep" => sweep = true,
+            "--uncached" => uncached = true,
             "--all" => skip_hidden = false,
             "--threads" => {
                 let v = args.get(i + 1).ok_or("--threads requires a number")?;
@@ -150,6 +154,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             path,
             bulk,
             sweep,
+            uncached,
             threads,
             filter: Filter {
                 skip_hidden,
@@ -195,7 +200,7 @@ pub fn run(cfg: Config) -> i32 {
             return 1;
         }
         let path = files[0].to_str().unwrap_or(&cfg.path);
-        match hardware_interrupt::sweep_file(path, &hardware_interrupt::DEFAULT_SWEEP_SIZES) {
+        match hardware_interrupt::sweep_file(path, &hardware_interrupt::DEFAULT_SWEEP_SIZES, cfg.uncached) {
             Ok(s) => {
                 println!("block-size sweep · {} · {}", path, human_bytes(s.size_bytes));
                 for p in &s.points {
@@ -222,7 +227,7 @@ pub fn run(cfg: Config) -> i32 {
             files.len(),
             cfg.threads
         );
-        let m = hardware_interrupt::measure_bulk(&files, cfg.threads);
+        let m = hardware_interrupt::measure_bulk(&files, cfg.threads, cfg.uncached);
         println!(
             "bulk: {} files · {} · {:.2} MiB/s · {} threads · {} failed",
             m.file_count,
@@ -239,7 +244,7 @@ pub fn run(cfg: Config) -> i32 {
         let mut measured = Vec::with_capacity(files.len());
         for f in &files {
             let Some(p) = f.to_str() else { continue };
-            match hardware_interrupt::measure_file(p, SAMPLE_INTERVAL) {
+            match hardware_interrupt::measure_file(p, SAMPLE_INTERVAL, cfg.uncached) {
                 Ok(m) => measured.push(m),
                 Err(e) => eprintln!("skip {p}: {e}"),
             }

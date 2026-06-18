@@ -116,11 +116,13 @@ fn profile_body(root: &str, files: &[FileMeasurement]) -> String {
         0.0
     };
 
+    let uncached = files.first().map(|f| f.uncached).unwrap_or(false);
     let mut body = cards(&[
         ("FILES", files.len().to_string()),
         ("TOTAL SIZE", human_bytes(total_bytes)),
         ("AGG THROUGHPUT", format!("{agg_mibps:.1} MiB/s")),
         ("READ TIME", format!("{:.2} ms", total_nanos as f64 / 1e6)),
+        ("READ MODE", if uncached { "uncached".into() } else { "cached".into() }),
     ]);
 
     // Throughput per file — slowest first (bottlenecks on top), capped.
@@ -178,19 +180,20 @@ fn profile_body(root: &str, files: &[FileMeasurement]) -> String {
     let mut table = String::from(
         "<section class=\"chart\"><h2>Files</h2><table><thead><tr>\
 <th>path</th><th class=\"r\">size</th><th class=\"r\">throughput</th>\
-<th class=\"r\">avg latency</th><th class=\"r\">chunks</th><th class=\"r\">IRQs</th>\
+<th class=\"r\">avg</th><th class=\"r\">p99</th><th class=\"r\">chunks</th>\
 </tr></thead><tbody>",
     );
     for m in files {
+        let p99 = m.percentiles_ns(&[99.0])[0];
         table.push_str(&format!(
             "<tr><td>{}</td><td class=\"r\">{}</td><td class=\"r\">{:.1} MiB/s</td>\
-<td class=\"r\">{} ns</td><td class=\"r\">{}</td><td class=\"r\">{}</td></tr>",
+<td class=\"r\">{} ns</td><td class=\"r\">{} ns</td><td class=\"r\">{}</td></tr>",
             esc(&m.path),
             human_bytes(m.size_bytes),
             m.throughput_mib_s(),
             m.avg_chunk_nanos(),
+            p99,
             m.chunk_count,
-            m.timer_interrupts,
         ));
     }
     table.push_str("</tbody></table></section>");
@@ -208,6 +211,7 @@ fn bulk_body(root: &str, bulk: &BulkMeasurement) -> String {
         ("FILES", format!("{} · {} failed", bulk.file_count, bulk.errors)),
         ("TOTAL READ", human_bytes(bulk.bytes_read)),
         ("THROUGHPUT", format!("{:.1} MiB/s", bulk.throughput_mib_s())),
+        ("READ MODE", if bulk.uncached { "uncached".into() } else { "cached".into() }),
     ]);
 
     // Bytes processed per worker thread — the "threads" graph.
@@ -262,6 +266,7 @@ fn sweep_body(sweep: &SweepResult) -> String {
         ("FILE SIZE", human_bytes(sweep.size_bytes)),
         ("BLOCK SIZES", sweep.points.len().to_string()),
         ("BEST BLOCK", best_str),
+        ("READ MODE", if sweep.uncached { "uncached".into() } else { "cached".into() }),
     ]);
 
     let tput_rows: Vec<(String, f64, String)> = sweep

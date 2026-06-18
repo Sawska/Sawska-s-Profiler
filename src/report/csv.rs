@@ -19,21 +19,27 @@ pub fn render(r: &Report) -> String {
     match r {
         Report::Profile { files, .. } => {
             out.push_str(
-                "path,size_bytes,bytes_read,wall_nanos,throughput_mib_s,chunk_count,\
-avg_chunk_ns,min_chunk_ns,max_chunk_ns,read_busy_fraction,timer_interrupts,counter_hz\n",
+                "path,size_bytes,bytes_read,wall_nanos,throughput_mib_s,uncached,chunk_count,\
+avg_chunk_ns,min_chunk_ns,max_chunk_ns,p50_ns,p95_ns,p99_ns,read_busy_fraction,\
+timer_interrupts,counter_hz\n",
             );
             for m in files {
+                let p = m.percentiles_ns(&[50.0, 95.0, 99.0]);
                 out.push_str(&format!(
-                    "{},{},{},{},{:.4},{},{},{},{},{:.4},{},{}\n",
+                    "{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{:.4},{},{}\n",
                     field(&m.path),
                     m.size_bytes,
                     m.bytes_read,
                     m.wall_nanos,
                     m.throughput_mib_s(),
+                    m.uncached,
                     m.chunk_count,
                     m.avg_chunk_nanos(),
                     m.min_chunk_nanos(),
                     m.max_chunk_nanos(),
+                    p[0],
+                    p[1],
+                    p[2],
                     m.read_busy_fraction(),
                     m.timer_interrupts,
                     m.counter_hz,

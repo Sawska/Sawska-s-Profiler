@@ -471,6 +471,7 @@ impl Ui {
         } else {
             (Filter::default(), SortKey::Throughput)
         };
+        let uncached = self.prompt_uncached();
         println!();
 
         let files = match hardware_interrupt::collect_files_filtered(&input, &filter) {
@@ -487,9 +488,9 @@ impl Ui {
 
         let measured = if files.len() == 1 {
             let path = files[0].to_str().unwrap_or(&input);
-            self.profile_single(path).into_iter().collect()
+            self.profile_single(path, uncached).into_iter().collect()
         } else {
-            self.profile_batch(&input, &files, sort)
+            self.profile_batch(&input, &files, sort, uncached)
         };
 
         if !measured.is_empty() {
@@ -503,11 +504,11 @@ impl Ui {
     /// Detailed profile of a single file: live bar + full report. The bar's
     /// refresh cadence is driven by the same hardware timer interrupt that
     /// produces the measurement samples.
-    fn profile_single(&self, path: &str) -> Option<FileMeasurement> {
+    fn profile_single(&self, path: &str, uncached: bool) -> Option<FileMeasurement> {
         // Draw an initial 0% bar so even instant reads show a frame.
         self.render_scan_bar(0, 1, 0);
 
-        match hardware_interrupt::measure_file_with(path, SAMPLE_INTERVAL, |p: Progress| {
+        match hardware_interrupt::measure_file_with(path, SAMPLE_INTERVAL, uncached, |p: Progress| {
             self.render_scan_bar(p.bytes_read, p.size_bytes, p.elapsed_nanos)
         }) {
             Ok(m) => {
@@ -529,7 +530,13 @@ impl Ui {
     /// hardware timer + handler are global, single-armed state) behind a live
     /// transient bar; afterwards the results are sorted and printed as a table
     /// followed by an aggregate report.
-    fn profile_batch(&self, root: &str, files: &[PathBuf], sort: SortKey) -> Vec<FileMeasurement> {
+    fn profile_batch(
+        &self,
+        root: &str,
+        files: &[PathBuf],
+        sort: SortKey,
+        uncached: bool,
+    ) -> Vec<FileMeasurement> {
         println!(
             "  {} {}",
             "BATCH SCAN".color(NEON_MAGENTA).bold(),
@@ -559,7 +566,7 @@ impl Ui {
 
             // Live, transient progress for the file currently being scanned.
             self.render_batch_bar(idx, total, &name, 0, 1, 0);
-            match hardware_interrupt::measure_file_with(path, SAMPLE_INTERVAL, |p: Progress| {
+            match hardware_interrupt::measure_file_with(path, SAMPLE_INTERVAL, uncached, |p: Progress| {
                 self.render_batch_bar(idx, total, &name, p.bytes_read, p.size_bytes, p.elapsed_nanos)
             }) {
                 Ok(m) => {
@@ -719,6 +726,14 @@ impl Ui {
         self.print_divider(NEON_PURPLE);
         self.report_row("TARGET", m.path.clone());
         self.report_row("SIZE", format!("{} bytes", m.size_bytes));
+        self.report_row(
+            "READ MODE",
+            if m.uncached {
+                "uncached (page cache bypassed)".to_string()
+            } else {
+                "cached".to_string()
+            },
+        );
         self.report_row("WALL TIME", format!("{:.3} ms", m.wall_nanos as f64 / 1e6));
         self.report_row("THROUGHPUT", format!("{:.2} MiB/s", m.throughput_mib_s()));
         self.report_row("CHUNKS", format!("{}", m.chunk_count));
@@ -730,6 +745,11 @@ impl Ui {
                 m.min_chunk_nanos(),
                 m.max_chunk_nanos(),
             ),
+        );
+        let pct = m.percentiles_ns(&[50.0, 95.0, 99.0]);
+        self.report_row(
+            "PERCENTILES",
+            format!("p50 {} ns · p95 {} ns · p99 {} ns", pct[0], pct[1], pct[2]),
         );
         self.report_row(
             "READ-BUSY",
@@ -876,6 +896,7 @@ impl Ui {
             Filter::default()
         };
         let threads = self.prompt_threads();
+        let uncached = self.prompt_uncached();
         println!();
 
         let files = match hardware_interrupt::collect_files_filtered(&input, &filter) {
@@ -897,7 +918,7 @@ impl Ui {
         );
         io::stdout().flush().unwrap();
 
-        let m = hardware_interrupt::measure_bulk(&files, threads);
+        let m = hardware_interrupt::measure_bulk(&files, threads, uncached);
 
         println!("  {}", "✓ BULK COMPLETE".color(NEON_GREEN).bold());
         println!();
@@ -907,6 +928,23 @@ impl Ui {
             root: input,
             bulk: m,
         });
+    }
+
+    /// Prompts whether to bypass the page cache (measure storage, not RAM).
+    fn prompt_uncached(&self) -> bool {
+        println!(
+            "  {} {}",
+            "READ MODE".color(NEON_CYAN).bold(),
+            "[cached / uncached · blank = cached]".color(DIM_SLATE),
+        );
+        print!("  {} ", "›".color(NEON_GREEN).bold());
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line).ok();
+        matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "uncached" | "u" | "cold" | "nocache"
+        )
     }
 
     /// Prompts for a worker-thread count (defaults to available parallelism).
@@ -937,6 +975,7 @@ impl Ui {
         self.print_divider(NEON_PURPLE);
         self.report_row("FILES", format!("{} · {} failed", m.file_count, m.errors));
         self.report_row("THREADS", format!("{}", m.threads));
+        self.report_row("READ MODE", if m.uncached { "uncached".into() } else { "cached".into() });
         self.report_row("TOTAL READ", human_bytes(m.bytes_read));
         self.report_row("WALL TIME", format!("{:.3} ms", m.wall_nanos as f64 / 1e6));
         self.report_row("THROUGHPUT", format!("{:.2} MiB/s", m.throughput_mib_s()));
@@ -958,21 +997,27 @@ impl Ui {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "Cargo.toml".to_string());
         let input = self.prompt_path(&default);
-        println!();
 
         if !Path::new(&input).is_file() {
+            println!();
             self.scan_error("block-size sweep needs a single file");
             return;
         }
+        let uncached = self.prompt_uncached();
+        println!();
 
         println!(
             "  {} {}",
             "SWEEPING".color(NEON_PURPLE).bold(),
-            "reading at 4 KiB → 16 MiB block sizes…".color(DIM_SLATE),
+            format!(
+                "reading at 4 KiB → 16 MiB block sizes ({})…",
+                if uncached { "uncached" } else { "cached" }
+            )
+            .color(DIM_SLATE),
         );
         io::stdout().flush().unwrap();
 
-        match hardware_interrupt::sweep_file(&input, &hardware_interrupt::DEFAULT_SWEEP_SIZES) {
+        match hardware_interrupt::sweep_file(&input, &hardware_interrupt::DEFAULT_SWEEP_SIZES, uncached) {
             Ok(s) => {
                 println!("  {}", "✓ SWEEP COMPLETE".color(NEON_GREEN).bold());
                 println!();
@@ -988,6 +1033,7 @@ impl Ui {
         self.print_divider(NEON_PURPLE);
         self.report_row("FILE", s.path.clone());
         self.report_row("SIZE", human_bytes(s.size_bytes));
+        self.report_row("READ MODE", if s.uncached { "uncached".into() } else { "cached".into() });
         println!("  {}", "THROUGHPUT BY BLOCK SIZE".color(NEON_CYAN).bold());
 
         let max = s

@@ -35,20 +35,26 @@ fn file_object(m: &FileMeasurement) -> String {
         buckets.push_str(&format!("{{\"max_ns\":{bound},\"count\":{count}}}"));
     }
 
+    let pct = m.percentiles_ns(&[50.0, 95.0, 99.0]);
     format!(
         "{{\"path\":\"{}\",\"size_bytes\":{},\"bytes_read\":{},\"wall_nanos\":{},\
-\"throughput_mib_s\":{:.4},\"chunk_count\":{},\"avg_chunk_ns\":{},\"min_chunk_ns\":{},\
-\"max_chunk_ns\":{},\"read_busy_fraction\":{:.4},\"timer_interrupts\":{},\"counter_hz\":{},\
+\"throughput_mib_s\":{:.4},\"uncached\":{},\"chunk_count\":{},\"avg_chunk_ns\":{},\
+\"min_chunk_ns\":{},\"max_chunk_ns\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\
+\"read_busy_fraction\":{:.4},\"timer_interrupts\":{},\"counter_hz\":{},\
 \"samples\":{},\"latency_histogram\":[{}]}}",
         esc(&m.path),
         m.size_bytes,
         m.bytes_read,
         m.wall_nanos,
         m.throughput_mib_s(),
+        m.uncached,
         m.chunk_count,
         m.avg_chunk_nanos(),
         m.min_chunk_nanos(),
         m.max_chunk_nanos(),
+        pct[0],
+        pct[1],
+        pct[2],
         m.read_busy_fraction(),
         m.timer_interrupts,
         m.counter_hz,
@@ -88,11 +94,12 @@ pub fn render(r: &Report) -> String {
                 })
                 .collect();
             format!(
-                "{{\"kind\":\"bulk\",\"root\":\"{}\",\"threads\":{},\"file_count\":{},\
-\"bytes_read\":{},\"wall_nanos\":{},\"throughput_mib_s\":{:.4},\"errors\":{},\
-\"counter_hz\":{},\"counter_ticks\":{},\"per_thread\":[{}]}}\n",
+                "{{\"kind\":\"bulk\",\"root\":\"{}\",\"threads\":{},\"uncached\":{},\
+\"file_count\":{},\"bytes_read\":{},\"wall_nanos\":{},\"throughput_mib_s\":{:.4},\
+\"errors\":{},\"counter_hz\":{},\"counter_ticks\":{},\"per_thread\":[{}]}}\n",
                 esc(root),
                 bulk.threads,
+                bulk.uncached,
                 bulk.file_count,
                 bulk.bytes_read,
                 bulk.wall_nanos,
@@ -123,10 +130,11 @@ pub fn render(r: &Report) -> String {
             let best = sweep.best().map(|p| p.chunk_size.to_string()).unwrap_or_else(|| "null".into());
             format!(
                 "{{\"kind\":\"sweep\",\"path\":\"{}\",\"size_bytes\":{},\"counter_hz\":{},\
-\"best_chunk_size\":{},\"points\":[{}]}}\n",
+\"uncached\":{},\"best_chunk_size\":{},\"points\":[{}]}}\n",
                 esc(&sweep.path),
                 sweep.size_bytes,
                 sweep.counter_hz,
+                sweep.uncached,
                 best,
                 points.join(",")
             )
